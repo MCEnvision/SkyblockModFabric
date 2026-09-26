@@ -53,6 +53,25 @@ Requirements:
 
 Run `/cofl` in-game to open settings. See [sky.coflnet.com](https://sky.coflnet.com/wiki) for documentation.
 
+### Trade pricing
+
+Enable the overlay with `/cofl tradegui on`, or disable it with
+`/cofl tradegui off`. `/cl` is an alias. The command and its `on` and `off`
+arguments support tab completion without waiting for backend commands to load.
+Open a new trade after enabling it.
+
+The trade menu pricing button cycles through LBIN, median, full craft cost, and
+the existing estimate mode. LBIN and median prefer matching market quotes.
+Full craft cost includes upgrades and uses the offered item's tooltip quote.
+If that field is hidden, selecting full craft cost fetches a separate quote from
+the description API without changing your saved tooltip layout.
+
+Craft costs are per item and are multiplied by the offered count. They describe
+replacement cost, not expected resale profit. Missing full craft costs, including
+items reported as not craftable, appear as `?` and make the total incomplete.
+The fallback uses the API's default ingredient pricing. A visible tooltip quote
+retains the ingredient pricing selected in your lore settings.
+
 ### Info displays
 
 Up to 3 permanent, backend-updatable HUD panels ("info displays") can be shown at all times in-game — for

@@ -10,9 +10,7 @@ import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -24,8 +22,11 @@ public final class TradePriceCache {
     private static final AtomicBoolean workerRunning = new AtomicBoolean();
     private static final AtomicReference<Request> queued = new AtomicReference<>();
 
-    private static volatile Map<String, Prices> prices = Map.of();
-    private static final List<ItemStack> seenItems = new ArrayList<>();
+    private static List<PricedItem> prices = List.of();
+    private static List<ItemStack> lastOffered = List.of();
+    private static long revision;
+    private static long retryAfter;
+    private static boolean includeCraftCost;
 
     private TradePriceCache() {
     }
@@ -34,8 +35,22 @@ public final class TradePriceCache {
         generation.incrementAndGet();
         sequence.incrementAndGet();
         queued.set(null);
-        prices = Map.of();
-        seenItems.clear();
+        prices = List.of();
+        lastOffered = List.of();
+        retryAfter = 0L;
+        includeCraftCost = false;
+        revision++;
+    }
+
+    public static long revision() {
+        return revision;
+    }
+
+    /** Retry transient failures only while the trade screen remains open. */
+    public static void retryIfNeeded(ContainerScreen screen) {
+        if (retryAfter != 0L && System.currentTimeMillis() >= retryAfter) {
+            requestCurrentTrade(screen.getMenu().containerId);
+        }
     }
 
     /** Ignore packets unless they belong to the verified trade menu that is actually open. */
@@ -57,43 +72,69 @@ public final class TradePriceCache {
         request(screen);
     }
 
-    /** Queue one debounced refresh when a previously unseen exact item enters the offer. */
+    /** Only changed offers require copying the inventory or queuing a description request. */
     public static void request(ContainerScreen screen) {
-        if (screen == null || !CoflModClient.isTradeScreen(screen)) {
-            return;
-        }
+        request(screen, false);
+    }
 
-        NonNullList<ItemStack> snapshot = copyItems(screen.getMenu().getItems());
-        List<ItemStack> offered = tradeItems(snapshot);
-        long requestGeneration = generation.get();
-        boolean hasNewItem = false;
-        for (ItemStack item : offered) {
-            if (shouldPrice(item) && !containsExact(seenItems, item)) {
-                seenItems.add(item.copy());
-                hasNewItem = true;
-            }
+    public static void selectBasis(ContainerScreen screen, WorthBasis basis) {
+        if (screen == null || !CoflModClient.isTradeScreen(screen)) return;
+        boolean selected = basis == WorthBasis.FULL_CRAFT_COST;
+        boolean newlySelected = selected && !includeCraftCost;
+        includeCraftCost = selected;
+        if (newlySelected) request(screen, true);
+    }
+
+    private static void request(ContainerScreen screen, boolean force) {
+        if (screen == null || !CoflModClient.isTradeScreen(screen)) return;
+        List<ItemStack> offered = tradeItems(screen.getMenu().getItems());
+        boolean unchanged = offered.size() == lastOffered.size();
+        for (int i = 0; unchanged && i < offered.size(); i++) {
+            unchanged = ItemStack.matches(offered.get(i), lastOffered.get(i));
         }
-        if (!hasNewItem) {
-            return;
-        }
-        prices = Map.copyOf(readPrices(offered, false));
+        if (!force && unchanged && (retryAfter == 0L || System.currentTimeMillis() < retryAfter)) return;
+
+        lastOffered = offered.stream().map(ItemStack::copy).toList();
+        retryAfter = 0L;
+        // Removals must invalidate in-flight responses too. Retain only exact, still-offered quotes.
         long requestSequence = sequence.incrementAndGet();
-        queued.set(new Request(
-                screen.getTitle().getString(), snapshot, offered,
-                requestGeneration, requestSequence));
+        queued.set(null);
+        prices = prices.stream().filter(price -> containsExact(offered, price.stack)).toList();
+        revision++;
+        if (offered.stream().noneMatch(item -> {
+            if (!shouldPrice(item)) return false;
+            PricedItem price = findPrice(item);
+            return price == null || (includeCraftCost && !price.craftResolved);
+        })) return;
+
+        queued.set(new Request(screen.getTitle().getString(), copyItems(screen.getMenu().getItems()),
+                generation.get(), requestSequence, includeCraftCost, prices));
         drain();
     }
 
     public static Long worth(ItemStack stack, WorthBasis basis) {
-        if (stack == null || stack.isEmpty()) {
-            return null;
+        PricedItem value = findPrice(stack);
+        return value == null ? null : switch (basis) {
+            case LBIN -> value.lbin;
+            case MEDIAN -> value.median;
+            case FULL_CRAFT_COST -> value.fullCraftCost;
+            case AI_ESTIMATE -> value.aiEstimate;
+        };
+    }
+
+    /** Offered items must use their own quote, never another same-name item's shared tooltip. */
+    public static DescriptionHandler.DescModification[] tooltipData(ItemStack stack, String stackId) {
+        if (!containsExact(lastOffered, stack)) return CoflModClient.getMappedTooltipData(stackId);
+        PricedItem price = findPrice(stack);
+        return price == null ? null : price.tips;
+    }
+
+    private static PricedItem findPrice(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return null;
+        for (PricedItem price : prices) {
+            if (ItemStack.matches(price.stack, stack)) return price;
         }
-        Prices value = prices.get(CoflModClient.getIdFromStack(stack));
-        if (value == null) {
-            return null;
-        }
-        long worth = basis == WorthBasis.LBIN ? value.lbin : value.median;
-        return worth > 0L ? worth : null;
+        return null;
     }
 
     public static Long stackWorth(ItemStack stack, WorthBasis basis) {
@@ -173,47 +214,100 @@ public final class TradePriceCache {
 
     private static void load(Request request) {
         try {
-            if (!isCurrent(request)) {
-                return;
+            if (!isCurrent(request)) return;
+            boolean needsDescriptions = tradeItems(request.items).stream().anyMatch(stack ->
+                    shouldPrice(stack) && findPrice(request.cached, stack) == null);
+            var tips = needsDescriptions
+                    ? CoflModClient.loadDescriptionsForItemsBlocking(request.title, request.items)
+                    : cachedTips(request);
+            List<PricedItem> loaded = new ArrayList<>();
+            readPrices(loaded, request, tips, CoflModClient.TRADE_YOUR_SLOTS);
+            readPrices(loaded, request, tips, CoflModClient.TRADE_THEIR_SLOTS);
+            boolean craftFailed = false;
+            if (request.includeCraftCost && loaded.stream().anyMatch(price -> !price.craftResolved)) {
+                if (!isCurrent(request)) return;
+                try {
+                    var costs = CoflModClient.descriptionRequest(request.title, request.items).loadFullCraftCosts();
+                    loaded.replaceAll(price -> price.craftResolved ? price : new PricedItem(price.stack,
+                            price.lbin, price.median, price.aiEstimate, craftCost(costs[price.slot]), true,
+                            price.slot, price.tips));
+                } catch (Exception exception) {
+                    System.out.println("[trade] full craft cost refresh failed, " + exception);
+                    craftFailed = true;
+                }
             }
-            CoflModClient.loadDescriptionsForItemsBlocking(request.title, request.items);
-            Map<String, Prices> loaded = readPrices(request.offered, true);
-            if (isCurrent(request)) {
-                prices = Map.copyOf(loaded);
-            }
+            boolean retryCraftCost = craftFailed;
+            Minecraft.getInstance().execute(() -> {
+                if (isCurrent(request)) {
+                    if (needsDescriptions) {
+                        String[] ids = CoflModClient.getItemIdsFromInventory(request.items);
+                        for (int slot = 0; slot < ids.length; slot++) {
+                            DescriptionHandler.tooltipItemIdMap.put(ids[slot], tips[slot]);
+                        }
+                        CoflModClient.descriptionsVersion.incrementAndGet();
+                    }
+                    prices = List.copyOf(loaded);
+                    retryAfter = retryCraftCost ? System.currentTimeMillis() + 2_000L : 0L;
+                    revision++;
+                }
+            });
         } catch (Exception exception) {
             System.out.println("[trade] description refresh failed, " + exception);
+            Minecraft.getInstance().execute(() -> {
+                if (isCurrent(request)) retryAfter = System.currentTimeMillis() + 2_000L;
+            });
         }
     }
 
-    private static Map<String, Prices> readPrices(List<ItemStack> items, boolean preferCurrentId) {
-        Map<String, Prices> result = new HashMap<>();
-        for (ItemStack stack : items) {
-            if (!shouldPrice(stack)) {
-                continue;
-            }
-            String id = CoflModClient.getIdFromStack(stack);
-            DescriptionHandler.DescModification[] tips = preferCurrentId
-                    ? DescriptionHandler.getTooltipData(id)
-                    : CoflModClient.getMappedTooltipData(id);
-            if (tips == null && preferCurrentId) {
-                tips = CoflModClient.getMappedTooltipData(id);
-            }
-            Long lbin = CoflModClient.parseWorthFromTips(tips, WorthBasis.LBIN);
-            Long median = CoflModClient.parseWorthFromTips(tips, WorthBasis.MEDIAN);
-            if (lbin != null || median != null) {
-                result.put(id, new Prices(value(lbin), value(median)));
-            }
+    private static void readPrices(List<PricedItem> result, Request request,
+                                   DescriptionHandler.DescModification[][] descriptions, int[] slots) {
+        List<ItemStack> items = request.items;
+        for (int slot : slots) {
+            if (slot >= items.size()) continue;
+            ItemStack stack = items.get(slot);
+            if (!shouldPrice(stack)) continue;
+            var tips = descriptions[slot];
+            String[] lines = tips == null ? null : java.util.Arrays.stream(tips)
+                    .map(tip -> tip == null ? null : tip.value).toArray(String[]::new);
+            Long lbin = com.coflnet.core.TradeValuation.parseWorthFromTips(lines,
+                    com.coflnet.core.TradeValuation.WorthBasis.LBIN, stack.getCount());
+            Long median = com.coflnet.core.TradeValuation.parseWorthFromTips(lines,
+                    com.coflnet.core.TradeValuation.WorthBasis.MEDIAN, stack.getCount());
+            Long aiEstimate = com.coflnet.core.TradeValuation.parseWorthFromTips(lines,
+                    com.coflnet.core.TradeValuation.WorthBasis.AI_ESTIMATE, stack.getCount());
+            PricedItem cached = findPrice(request.cached, stack);
+            Long fullCraftCost = craftCost(tips);
+            if (fullCraftCost == null && cached != null) fullCraftCost = cached.fullCraftCost;
+            boolean craftResolved = fullCraftCost != null || (cached != null && cached.craftResolved);
+            result.add(new PricedItem(stack, lbin, median, aiEstimate, fullCraftCost, craftResolved, slot, tips));
         }
-        return result;
+    }
+
+    private static Long craftCost(DescriptionHandler.DescModification[] tips) {
+        String[] lines = tips == null ? null : java.util.Arrays.stream(tips)
+                .map(tip -> tip == null ? null : tip.value).toArray(String[]::new);
+        return com.coflnet.core.TradeValuation.parseWorthFromTips(lines,
+                com.coflnet.core.TradeValuation.WorthBasis.FULL_CRAFT_COST);
+    }
+
+    private static PricedItem findPrice(List<PricedItem> cached, ItemStack stack) {
+        for (PricedItem price : cached) {
+            if (ItemStack.matches(price.stack, stack)) return price;
+        }
+        return null;
+    }
+
+    private static DescriptionHandler.DescModification[][] cachedTips(Request request) {
+        var tips = new DescriptionHandler.DescModification[request.items.size()][];
+        for (int slot = 0; slot < request.items.size(); slot++) {
+            PricedItem price = findPrice(request.cached, request.items.get(slot));
+            if (price != null) tips[slot] = price.tips;
+        }
+        return tips;
     }
 
     private static boolean shouldPrice(ItemStack stack) {
         return stack != null && !stack.isEmpty() && CoflModClient.parseCoinStack(stack) == null;
-    }
-
-    private static long value(Long value) {
-        return value == null ? 0L : value;
     }
 
     private static boolean isCurrent(Request request) {
@@ -228,7 +322,7 @@ public final class TradePriceCache {
         return copy;
     }
 
-    private static List<ItemStack> tradeItems(NonNullList<ItemStack> items) {
+    private static List<ItemStack> tradeItems(List<ItemStack> items) {
         List<ItemStack> result = new ArrayList<>(
                 CoflModClient.TRADE_YOUR_SLOTS.length + CoflModClient.TRADE_THEIR_SLOTS.length);
         appendSlots(result, items, CoflModClient.TRADE_YOUR_SLOTS);
@@ -236,9 +330,9 @@ public final class TradePriceCache {
         return List.copyOf(result);
     }
 
-    private static void appendSlots(List<ItemStack> result, NonNullList<ItemStack> items, int[] slots) {
+    private static void appendSlots(List<ItemStack> result, List<ItemStack> items, int[] slots) {
         for (int slot : slots) {
-            result.add(slot < items.size() ? items.get(slot).copy() : ItemStack.EMPTY);
+            result.add(slot < items.size() ? items.get(slot) : ItemStack.EMPTY);
         }
     }
 
@@ -252,11 +346,13 @@ public final class TradePriceCache {
     private record Request(
             String title,
             NonNullList<ItemStack> items,
-            List<ItemStack> offered,
             long generation,
-            long sequence) {
+            long sequence,
+            boolean includeCraftCost,
+            List<PricedItem> cached) {
     }
 
-    private record Prices(long lbin, long median) {
+    private record PricedItem(ItemStack stack, Long lbin, Long median, Long aiEstimate, Long fullCraftCost,
+                              boolean craftResolved, int slot, DescriptionHandler.DescModification[] tips) {
     }
 }
