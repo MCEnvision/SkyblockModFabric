@@ -1,11 +1,11 @@
 # SkyblockModFabric
 
-SkyblockModFabric is a Hypixel SkyBlock mod for Minecraft Fabric (1.21.5+).
+SkyblockModFabric is a Hypixel SkyBlock mod for Minecraft 26.2 with Fabric.
 It provides in-game access to [sky.coflnet.com](https://sky.coflnet.com) auction house and bazaar data.
 
 For the Forge edition, see [Coflnet/Skyblockmod](https://github.com/Coflnet/Skyblockmod).
 
-Current version: **1.9.3** | [Releases](https://github.com/Coflnet/SkyblockModFabric/releases)
+Checkout version: **2.0.0-pre1** | [Releases](https://github.com/Coflnet/SkyblockModFabric/releases)
 
 ## License
 
@@ -45,7 +45,7 @@ resource loading, including the zero-width Text Tunnels marker font, with `inval
 Restart Minecraft after installing to load the new build.
 
 Requirements:
-- Minecraft 1.21.5+ - 26.2
+- Minecraft 26.2
 - Fabric Loader 0.19.3+
 - Fabric API 0.152.2+
 
@@ -57,8 +57,12 @@ Run `/cofl` in-game to open settings. See [sky.coflnet.com](https://sky.coflnet.
 
 Enable the overlay with `/cofl tradegui on`, or disable it with
 `/cofl tradegui off`. `/cl` is an alias. The command and its `on` and `off`
-arguments support tab completion without waiting for backend commands to load.
-Open a new trade after enabling it.
+arguments are supplied by the backend through `commandUpdate`, cached in
+CoflSkyCore, and offered through Fabric's existing generic command suggestions.
+The command is forwarded to SkyModCommands, which sends a `tradeGui` response.
+Fabric applies and saves the setting on the client thread. This requires the
+matching Commands and Core changes; the fork alone does not change the live
+Coflnet service. Open a new trade after enabling it.
 
 The trade menu pricing button cycles through LBIN, median, full craft cost, and
 the existing estimate mode. LBIN and median prefer matching market quotes.
@@ -140,6 +144,8 @@ saved as fractions of the screen, so they hold up across resolution and GUI-scal
 chat) open — toggle this with "Show info displays while a GUI is open" in `/cofl` → SkyCofl settings.
 
 ## Links
+
+- [Documentation](docs/README.md)
 
 - [Releases](https://github.com/Coflnet/SkyblockModFabric/releases)
 - [Issue Tracker](https://github.com/Coflnet/SkyblockModFabric/issues)
